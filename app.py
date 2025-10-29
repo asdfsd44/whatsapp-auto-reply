@@ -4,7 +4,7 @@ import os
 
 app = Flask(__name__)
 
-# Variáveis de ambiente (configuradas no Render)
+# Variáveis de ambiente
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
@@ -12,11 +12,13 @@ NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 
 @app.route("/webhook", methods=["GET"])
 def verify():
-    """Verificação inicial exigida pelo Meta"""
+    """Verificação inicial do Meta"""
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
     if token == VERIFY_TOKEN:
+        print("✔️ Verificação de webhook bem-sucedida")
         return challenge
+    print("❌ Falha na verificação do webhook")
     return "Erro de verificação", 403
 
 
@@ -38,16 +40,19 @@ def webhook():
                 sender = messages[0]["from"]
                 phone_number_id = value["metadata"]["phone_number_id"]
 
-                # Envia mensagem de texto
+                print(f"📩 Nova mensagem recebida de {sender}")
+
+                # 1️⃣ Envia mensagem de texto
                 text_message = (
                     "Olá! Este número não está mais ativo. "
                     "Por favor, salve meu novo contato para continuar falando comigo.\n\n"
                     f"👉 https://wa.me/{NEW_NUMBER.replace('+', '')}"
                 )
 
-                send_message(phone_number_id, sender, {"text": {"body": text_message}})
+                resp_text = send_message(phone_number_id, sender, {"text": {"body": text_message}})
+                print(f"✉️ Texto enviado para {sender} → Status: {resp_text.status_code} / {resp_text.text}")
 
-                # Envia o contato (vCard)
+                # 2️⃣ Envia o contato (vCard)
                 vcard_payload = {
                     "messaging_product": "whatsapp",
                     "to": sender,
@@ -67,18 +72,17 @@ def webhook():
                     "Authorization": f"Bearer {ACCESS_TOKEN}",
                     "Content-Type": "application/json",
                 }
-                requests.post(url, json=vcard_payload, headers=headers)
-
-                print(f"✔️ Mensagem e contato enviados para {sender}")
+                resp_vcard = requests.post(url, json=vcard_payload, headers=headers)
+                print(f"📇 Contato enviado para {sender} → Status: {resp_vcard.status_code} / {resp_vcard.text}")
 
     except Exception as e:
-        print(f"❌ Erro ao processar: {e}")
+        print(f"❌ Erro ao processar webhook: {e}")
 
     return "OK", 200
 
 
 def send_message(phone_number_id, to, message_content):
-    """Função auxiliar para enviar mensagens"""
+    """Função auxiliar para enviar mensagens de texto"""
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}",
@@ -89,9 +93,11 @@ def send_message(phone_number_id, to, message_content):
         "to": to,
     }
     payload.update(message_content)
-    requests.post(url, json=payload, headers=headers)
+    response = requests.post(url, json=payload, headers=headers)
+    return response
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
