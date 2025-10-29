@@ -52,14 +52,17 @@ def webhook():
                 resp_text = send_message(phone_number_id, sender, {"text": {"body": text_message}})
                 print(f"✉️ Texto enviado para {sender} → Status: {resp_text.status_code} / {resp_text.text}")
 
-                # 2️⃣ Envia o contato (vCard)
+                # 2️⃣ Envia o contato (vCard) com first_name obrigatório
                 vcard_payload = {
                     "messaging_product": "whatsapp",
                     "to": sender,
                     "type": "contacts",
                     "contacts": [
                         {
-                            "name": {"formatted_name": NEW_NAME},
+                            "name": {
+                                "formatted_name": NEW_NAME,
+                                "first_name": NEW_NAME.split(" ")[0]
+                            },
                             "phones": [
                                 {"phone": NEW_NUMBER, "type": "CELL"}
                             ],
