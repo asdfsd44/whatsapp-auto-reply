@@ -10,6 +10,8 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 
+REMETENTES_FILE = "remetentes.txt"
+
 @app.route("/webhook", methods=["GET"])
 def verify():
     """Verificação inicial do Meta"""
@@ -41,6 +43,10 @@ def webhook():
                 phone_number_id = value["metadata"]["phone_number_id"]
 
                 print(f"📩 Nova mensagem recebida de {sender}")
+
+                # Salva o remetente no arquivo
+                with open(REMETENTES_FILE, "a") as f:
+                    f.write(f"{sender}\n")
 
                 # 1️⃣ Envia mensagem de texto
                 text_message = (
