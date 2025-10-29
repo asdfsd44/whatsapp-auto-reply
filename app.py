@@ -8,6 +8,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
+NEW_NUMBER2 = os.environ.get("NEW_NUMBER2")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 
 REMETENTES_FILE = "remetentes.txt"
@@ -70,7 +71,7 @@ def webhook():
                                 "first_name": NEW_NAME.split(" ")[0]
                             },
                             "phones": [
-                                {"phone": NEW_NUMBER, "type": "CELL"}
+                                {"phone": NEW_NUMBER2, "type": "CELL"}
                             ],
                         }
                     ],
@@ -110,3 +111,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
+
