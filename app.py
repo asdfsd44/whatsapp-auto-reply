@@ -103,7 +103,7 @@ END:VCARD
         # 3️⃣ Upload do arquivo para a Meta (media endpoint)
         upload_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
         files = {
-    'file': ('contato.vcf', arquivo_vcf, 'text/plain'),
+    'file': ('contato.vcf', arquivo_vcf, 'application/octet-stream'),
         }
         data = {'messaging_product': 'whatsapp'}
         headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
