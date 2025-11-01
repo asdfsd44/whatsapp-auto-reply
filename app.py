@@ -1,6 +1,7 @@
 from flask import Flask, request
 import requests
 import os
+import io
 
 app = Flask(__name__)
 
@@ -8,7 +9,6 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
-NEW_NUMBER2 = os.environ.get("NEW_NUMBER2")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 
 REMETENTES_FILE = "remetentes.txt"
@@ -52,38 +52,15 @@ def webhook():
                 # 1️⃣ Envia mensagem de texto
                 text_message = (
                     "Olá! Este número não está mais ativo. "
-                    "Por favor, salve meu novo contato para continuar falando comigo.\n\n"
+                    "Por favor, salve meu novo contato.\n\n"
                     f"👉 https://wa.me/{NEW_NUMBER.replace('+', '')}"
                 )
 
                 resp_text = send_message(phone_number_id, sender, {"text": {"body": text_message}})
                 print(f"✉️ Texto enviado para {sender} → Status: {resp_text.status_code} / {resp_text.text}")
 
-                # 2️⃣ Envia o contato (vCard) com first_name obrigatório
-                vcard_payload = {
-                    "messaging_product": "whatsapp",
-                    "to": sender,
-                    "type": "contacts",
-                    "contacts": [
-                        {
-                            "name": {
-                                "formatted_name": NEW_NAME,
-                                "first_name": NEW_NAME.split(" ")[0]
-                            },
-                            "phones": [
-                                {"phone": NEW_NUMBER2, "type": "CELL"}
-                            ],
-                        }
-                    ],
-                }
-
-                url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
-                headers = {
-                    "Authorization": f"Bearer {ACCESS_TOKEN}",
-                    "Content-Type": "application/json",
-                }
-                resp_vcard = requests.post(url, json=vcard_payload, headers=headers)
-                print(f"📇 Contato enviado para {sender} → Status: {resp_vcard.status_code} / {resp_vcard.text}")
+                # 2️⃣ Envia o novo contato real em formato .VCF
+                send_vcard(phone_number_id, sender)
 
     except Exception as e:
         print(f"❌ Erro ao processar webhook: {e}")
@@ -107,8 +84,65 @@ def send_message(phone_number_id, to, message_content):
     return response
 
 
+def send_vcard(phone_number_id, to):
+    """Gera e envia o vCard real (.vcf) diretamente pela API"""
+    try:
+        # 1️⃣ Conteúdo do vCard
+        vcard_content = f"""BEGIN:VCARD
+VERSION:3.0
+N:{NEW_NAME};Contato;;;
+FN:{NEW_NAME}
+ORG:{NEW_NAME}
+TEL;type=CELL;waid={NEW_NUMBER.replace('+', '')}:{NEW_NUMBER}
+END:VCARD
+"""
+
+        # 2️⃣ Gera arquivo em memória
+        arquivo_vcf = io.BytesIO(vcard_content.encode("utf-8"))
+
+        # 3️⃣ Upload do arquivo para a Meta (media endpoint)
+        upload_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
+        files = {
+            'file': ('contato.vcf', arquivo_vcf, 'text/vcard'),
+        }
+        data = {'messaging_product': 'whatsapp'}
+        headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
+
+        upload_response = requests.post(upload_url, headers=headers, files=files, data=data)
+        upload_result = upload_response.json()
+        print(f"📤 Upload do vCard → {upload_response.status_code}: {upload_result}")
+
+        if 'id' not in upload_result:
+            print("❌ Falha ao subir o vCard:", upload_result)
+            return
+
+        media_id = upload_result['id']
+
+        # 4️⃣ Envia a mensagem de documento com o vCard
+        message_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "document",
+            "document": {
+                "id": media_id,
+                "filename": f"{NEW_NAME}.vcf"
+            }
+        }
+
+        headers = {
+            'Authorization': f'Bearer {ACCESS_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+
+        send_response = requests.post(message_url, headers=headers, json=payload)
+        print(f"📇 vCard enviado para {to} → {send_response.status_code} / {send_response.text}")
+
+    except Exception as e:
+        print(f"❌ Erro ao enviar vCard: {e}")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print(f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
-
