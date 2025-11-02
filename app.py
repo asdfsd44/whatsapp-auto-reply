@@ -1,37 +1,137 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import requests
 import os
 import io
+import json
+import time
+import threading
+import logging
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# 🔐 Variáveis de ambiente
+# ====================================
+# CONFIGURAÇÕES E VARIÁVEIS
+# ====================================
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
-
+FORWARD_NUMBER = os.environ.get("FORWARD_NUMBER", "+5534997216766")
 REMETENTES_FILE = "remetentes.txt"
+RETRY_FILE = "retries.json"
+LOG_FILE = "app.log"
 
+ALLOWED_MEDIA_TYPES = ["image", "document", "audio"]
+IGNORED_TYPES = ["status", "sticker", "reaction", "location", "unknown", "video"]
 
-# ✅ Verificação inicial do Webhook (Meta)
+MAX_RETRIES = 5
+RETRY_INTERVAL_SECONDS = 60  # intervalo entre reenvios
+
+# ====================================
+# LOGGING E UTILITÁRIOS
+# ====================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()]
+)
+
+def log(level, message, data=None):
+    msg = f"{message} | {json.dumps(data, ensure_ascii=False)}" if data else message
+    getattr(logging, level)(msg)
+
+def load_retries():
+    try:
+        if os.path.exists(RETRY_FILE):
+            with open(RETRY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def save_retries(queue):
+    with open(RETRY_FILE, "w", encoding="utf-8") as f:
+        json.dump(queue, f, ensure_ascii=False, indent=2)
+
+# ====================================
+# HEALTH CHECK
+# ====================================
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat()
+    }), 200
+
+# ====================================
+# FUNÇÕES DE MENSAGEM
+# ====================================
+def send_message(phone_number_id, to, message):
+    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+    payload = {"messaging_product": "whatsapp", "to": to}
+    payload.update(message)
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+        return resp
+    except Exception as e:
+        log("error", "Erro ao enviar mensagem", {"error": str(e)})
+        return None
+
+def download_media(media_id):
+    """Baixa mídia do servidor da Meta e retorna bytes."""
+    try:
+        media_url = f"https://graph.facebook.com/v20.0/{media_id}"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+        resp = requests.get(media_url, headers=headers).json()
+        url = resp.get("url")
+        if not url:
+            return None
+        media_data = requests.get(url, headers=headers).content
+        return media_data
+    except Exception as e:
+        log("error", "Erro ao baixar mídia", {"error": str(e)})
+        return None
+
+def forward_text(phone_number_id, text):
+    return send_message(phone_number_id, FORWARD_NUMBER.replace("+", ""), {"text": {"body": text}})
+
+def forward_media(phone_number_id, media_type, media_id, caption=None):
+    """Reenvia imagem, documento ou áudio para o número do Luiz."""
+    try:
+        if media_type not in ALLOWED_MEDIA_TYPES:
+            return False
+        url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
+        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": FORWARD_NUMBER.replace("+", ""),
+            "type": media_type,
+            media_type: {"id": media_id}
+        }
+        if caption:
+            payload[media_type]["caption"] = caption
+        r = requests.post(url, headers=headers, json=payload)
+        return r.status_code == 200
+    except Exception as e:
+        log("error", "Erro ao encaminhar mídia", {"error": str(e)})
+        return False
+
+# ====================================
+# PROCESSAMENTO DO WEBHOOK
+# ====================================
 @app.route("/webhook", methods=["GET"])
 def verify():
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if token == VERIFY_TOKEN:
-        print("✔️ Verificação de webhook bem-sucedida")
-        return challenge
-    print("❌ Falha na verificação do webhook")
+    if request.args.get("hub.verify_token") == VERIFY_TOKEN:
+        return request.args.get("hub.challenge")
     return "Erro de verificação", 403
 
-
-# 💬 Recebe mensagens e responde automaticamente
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
     if not data:
-        return "Sem conteúdo", 200
+        return "sem conteúdo", 200
 
     try:
         for entry in data.get("entry", []):
@@ -41,112 +141,84 @@ def webhook():
                 if not messages:
                     continue
 
-                sender = messages[0]["from"]
+                msg = messages[0]
+                sender = msg.get("from")
                 phone_number_id = value["metadata"]["phone_number_id"]
+                msg_type = msg.get("type", "text")
 
-                print(f"\n📩 Nova mensagem recebida de {sender}")
+                # ignora loops e tipos indesejados
+                if sender == FORWARD_NUMBER.replace("+", "") or msg_type in IGNORED_TYPES:
+                    continue
 
-                # Salva o remetente no arquivo (histórico)
-                with open(REMETENTES_FILE, "a") as f:
-                    f.write(f"{sender}\n")
+                text = msg.get("text", {}).get("body", "") if msg_type == "text" else ""
+                name = msg.get("profile", {}).get("name", "")
 
-                # 1️⃣ Envia mensagem de texto informativa
-                text_message = (
-                    "Olá! Este número não está mais ativo. "
-                    "Por favor, salve meu novo contato para continuar falando comigo.\n\n"
+                # responde automaticamente
+                reply = (
+                    f"Olá! Este número não está mais ativo.\n"
+                    f"Por favor, salve meu novo contato e me chame lá:\n"
                     f"👉 https://wa.me/{NEW_NUMBER.replace('+', '')}"
                 )
+                send_message(phone_number_id, sender, {"text": {"body": reply}})
 
-                resp_text = send_message(phone_number_id, sender, {"text": {"body": text_message}})
-                print(f"✉️ Texto enviado para {sender} → {resp_text.status_code} / {resp_text.text}")
+                # log e registro de remetente
+                with open(REMETENTES_FILE, "a", encoding="utf-8") as f:
+                    f.write(f"{sender}\t{name}\t{datetime.utcnow().isoformat()}\n")
 
-                # 2️⃣ Envia o contato real em formato .VCF
-                send_vcard(phone_number_id, sender)
+                # encaminha para Luiz
+                compact_text = f"📨 *Novo contato*\n👤 {name or 'Desconhecido'}\n📱 {sender}\n🕓 {datetime.now().strftime('%H:%M:%S')}\n💬 {text or '(mensagem de mídia)'}"
+                forward_text(phone_number_id, compact_text)
 
-    except Exception as e:
-        print(f"❌ Erro ao processar webhook: {e}")
-
-    return "OK", 200
-
-
-# 📤 Função auxiliar para enviar mensagens de texto
-def send_message(phone_number_id, to, message_content):
-    url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-    }
-    payload.update(message_content)
-    response = requests.post(url, json=payload, headers=headers)
-    return response
-
-
-# 📇 Função para gerar e enviar o vCard (contato)
-def send_vcard(phone_number_id, to):
-    """Gera e envia o vCard real (.vcf) diretamente pela API"""
-    try:
-        # 1️⃣ Conteúdo do vCard (ajustável)
-        vcard_content = f"""BEGIN:VCARD
-VERSION:3.0
-N:{NEW_NAME};Contato;;;
-FN:{NEW_NAME}
-ORG:{NEW_NAME}
-TEL;type=CELL;waid={NEW_NUMBER.replace('+', '')}:{NEW_NUMBER}
-END:VCARD
-"""
-
-        # 2️⃣ Gera o arquivo em memória
-        arquivo_vcf = io.BytesIO(vcard_content.encode("utf-8"))
-
-        # 3️⃣ Upload do arquivo aceito pela Meta (tipo text/plain)
-        upload_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
-        files = {
-            'file': ('contato.vcf', arquivo_vcf, 'text/plain'),
-        }
-        data = {'messaging_product': 'whatsapp'}
-        headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
-
-        upload_response = requests.post(upload_url, headers=headers, files=files, data=data)
-        upload_result = upload_response.json()
-        print(f"📤 Upload do vCard → {upload_response.status_code}: {upload_result}")
-
-        if 'id' not in upload_result:
-            print("❌ Falha ao subir o vCard:", upload_result)
-            return
-
-        media_id = upload_result['id']
-
-        # 4️⃣ Envia a mensagem com o vCard anexo
-        message_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
-        payload = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "document",
-            "document": {
-                "id": media_id,
-                "filename": "Contato_PachecoBecker.vcf",
-                "caption": "📇 Toque para salvar este contato e continuar a conversa."
-            }
-        }
-
-        headers = {
-            'Authorization': f'Bearer {ACCESS_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-
-        send_response = requests.post(message_url, headers=headers, json=payload)
-        print(f"📇 vCard enviado para {to} → {send_response.status_code} / {send_response.text}")
+                # se for mídia, encaminha também
+                if msg_type in ALLOWED_MEDIA_TYPES:
+                    media_id = msg[msg_type].get("id")
+                    caption = msg[msg_type].get("caption", "")
+                    forward_media(phone_number_id, msg_type, media_id, caption)
 
     except Exception as e:
-        print(f"❌ Erro ao enviar vCard: {e}")
+        log("error", "Erro no processamento do webhook", {"error": str(e)})
 
+    return "ok", 200
 
-# 🚀 Inicialização do servidor Flask
+# ====================================
+# ROTINA DE REENVIO (FILA)
+# ====================================
+def retry_worker():
+    """Thread de retry que tenta reenviar mensagens falhadas."""
+    while True:
+        try:
+            queue = load_retries()
+            new_queue = []
+            for item in queue:
+                if item.get("attempts", 0) >= MAX_RETRIES:
+                    continue
+                now = time.time()
+                if now - item.get("last_try", 0) < RETRY_INTERVAL_SECONDS:
+                    new_queue.append(item)
+                    continue
+
+                resp = send_message(item["phone_number_id"], item["to"], item["message"])
+                if not resp or resp.status_code != 200:
+                    item["attempts"] += 1
+                    item["last_try"] = now
+                    new_queue.append(item)
+                    log("warning", "Reenvio falhou", {"to": item["to"], "attempt": item["attempts"]})
+                else:
+                    log("info", "Reenvio bem-sucedido", {"to": item["to"]})
+
+            save_retries(new_queue)
+        except Exception as e:
+            log("error", "Erro na thread de retry", {"error": str(e)})
+
+        time.sleep(RETRY_INTERVAL_SECONDS)
+
+# inicia thread de retry
+threading.Thread(target=retry_worker, daemon=True).start()
+
+# ====================================
+# EXECUÇÃO
+# ====================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print(f"🚀 Servidor rodando em http://0.0.0.0:{port}")
+    log("info", f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
