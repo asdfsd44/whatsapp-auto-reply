@@ -168,16 +168,29 @@ def webhook():
                 # encaminha para Luiz (mensagem compacta e formatada)
                 from datetime import timezone, timedelta
 
-                def format_phone(num: str) -> str:
-                    """Formata número E.164 para exibição legível: 5534984044040 → 55 34 98404-4040"""
-                    digits = "".join(ch for ch in num if ch.isdigit())
-                    if len(digits) < 11:
-                        return digits
-                    ddi = digits[:2]
-                    ddd = digits[2:4]
-                    middle = digits[4:9]
-                    end = digits[9:]
-                    return f"{ddi} {ddd} {middle}-{end}"
+def format_phone(num: str) -> str:
+    """Formata número E.164 → 55 34 99721-6766"""
+    digits = "".join(ch for ch in num if ch.isdigit())
+    if len(digits) < 10:
+        return digits
+
+    ddi = digits[:2]   # ex: 55
+    ddd = digits[2:4]  # ex: 34
+
+    # número sem DDI/DDD
+    base = digits[4:]
+    if len(base) == 9:
+        prefixo = base[:5]
+        sufixo = base[5:]
+    elif len(base) == 8:
+        prefixo = base[:4]
+        sufixo = base[4:]
+    else:
+        # fallback genérico: separa últimos 4 dígitos
+        prefixo = base[:-4]
+        sufixo = base[-4:]
+
+    return f"{ddi} {ddd} {prefixo}-{sufixo}"
 
                 tz_brasilia = timezone(timedelta(hours=-3))
                 hora_local = datetime.now(tz_brasilia).strftime("%H:%M:%S")
@@ -246,3 +259,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
+
