@@ -6,7 +6,7 @@ import json
 import time
 import threading
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
 
@@ -18,6 +18,7 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 FORWARD_NUMBER = os.environ.get("FORWARD_NUMBER", "+5534997216766")
+
 REMETENTES_FILE = "remetentes.txt"
 RETRY_FILE = "retries.json"
 LOG_FILE = "app.log"
@@ -26,10 +27,10 @@ ALLOWED_MEDIA_TYPES = ["image", "document", "audio"]
 IGNORED_TYPES = ["status", "sticker", "reaction", "location", "unknown", "video"]
 
 MAX_RETRIES = 5
-RETRY_INTERVAL_SECONDS = 60  # intervalo entre reenvios
+RETRY_INTERVAL_SECONDS = 60  # intervalo entre tentativas
 
 # ====================================
-# LOGGING E UTILITÁRIOS
+# LOGGING
 # ====================================
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +42,9 @@ def log(level, message, data=None):
     msg = f"{message} | {json.dumps(data, ensure_ascii=False)}" if data else message
     getattr(logging, level)(msg)
 
+# ====================================
+# FUNÇÕES AUXILIARES
+# ====================================
 def load_retries():
     try:
         if os.path.exists(RETRY_FILE):
@@ -54,20 +58,18 @@ def save_retries(queue):
     with open(RETRY_FILE, "w", encoding="utf-8") as f:
         json.dump(queue, f, ensure_ascii=False, indent=2)
 
-# ====================================
-# HEALTH CHECK
-# ====================================
-@app.route("/health", methods=["GET"])
-def health_check():
-    return jsonify({
-        "status": "ok",
-        "timestamp": datetime.utcnow().isoformat()
-    }), 200
+def format_phone(num: str) -> str:
+    """Formata número E.164 → 55 34 997216766 (sem traço)"""
+    digits = "".join(ch for ch in num if ch.isdigit())
+    if len(digits) < 10:
+        return digits
+    ddi = digits[:2]
+    ddd = digits[2:4]
+    base = digits[4:]
+    return f"{ddi} {ddd} {base}"
 
-# ====================================
-# FUNÇÕES DE MENSAGEM
-# ====================================
 def send_message(phone_number_id, to, message):
+    """Envia mensagem genérica via API do WhatsApp"""
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": to}
@@ -79,26 +81,12 @@ def send_message(phone_number_id, to, message):
         log("error", "Erro ao enviar mensagem", {"error": str(e)})
         return None
 
-def download_media(media_id):
-    """Baixa mídia do servidor da Meta e retorna bytes."""
-    try:
-        media_url = f"https://graph.facebook.com/v20.0/{media_id}"
-        headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        resp = requests.get(media_url, headers=headers).json()
-        url = resp.get("url")
-        if not url:
-            return None
-        media_data = requests.get(url, headers=headers).content
-        return media_data
-    except Exception as e:
-        log("error", "Erro ao baixar mídia", {"error": str(e)})
-        return None
-
 def forward_text(phone_number_id, text):
+    """Encaminha texto para o número principal"""
     return send_message(phone_number_id, FORWARD_NUMBER.replace("+", ""), {"text": {"body": text}})
 
 def forward_media(phone_number_id, media_type, media_id, caption=None):
-    """Reenvia imagem, documento ou áudio para o número do Luiz."""
+    """Encaminha imagem, documento ou áudio (exceto vídeo)"""
     try:
         if media_type not in ALLOWED_MEDIA_TYPES:
             return False
@@ -119,7 +107,14 @@ def forward_media(phone_number_id, media_type, media_id, caption=None):
         return False
 
 # ====================================
-# PROCESSAMENTO DO WEBHOOK
+# HEALTH CHECK
+# ====================================
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
+
+# ====================================
+# WEBHOOK PRINCIPAL
 # ====================================
 @app.route("/webhook", methods=["GET"])
 def verify():
@@ -156,42 +151,19 @@ def webhook():
                 # responde automaticamente
                 reply = (
                     f"Olá! Este número não está mais ativo.\n"
-                    f"Por favor, salve meu novo contato\n"
+                    f"Por favor, salve meu novo contato e me chame lá:\n"
                     f"👉 https://wa.me/{NEW_NUMBER.replace('+', '')}"
                 )
                 send_message(phone_number_id, sender, {"text": {"body": reply}})
 
-                # log e registro de remetente
-                with open(REMETENTES_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"{sender}\t{name}\t{datetime.utcnow().isoformat()}\n")
+                # registra remetente
+                try:
+                    with open(REMETENTES_FILE, "a", encoding="utf-8") as f:
+                        f.write(f"{sender}\t{name}\t{datetime.utcnow().isoformat()}\n")
+                except Exception as e:
+                    log("error", "Erro ao registrar remetente", {"error": str(e)})
 
-                # encaminha para Luiz (mensagem compacta e formatada)
-                from datetime import timezone, timedelta
-
-def format_phone(num: str) -> str:
-    """Formata número E.164 → 55 34 99721-6766"""
-    digits = "".join(ch for ch in num if ch.isdigit())
-    if len(digits) < 10:
-        return digits
-
-    ddi = digits[:2]   # ex: 55
-    ddd = digits[2:4]  # ex: 34
-
-    # número sem DDI/DDD
-    base = digits[4:]
-    if len(base) == 9:
-        prefixo = base[:5]
-        sufixo = base[5:]
-    elif len(base) == 8:
-        prefixo = base[:4]
-        sufixo = base[4:]
-    else:
-        # fallback genérico: separa últimos 4 dígitos
-        prefixo = base[:-4]
-        sufixo = base[-4:]
-
-    return f"{ddi} {ddd} {prefixo}-{sufixo}"
-
+                # horário com fuso -03
                 tz_brasilia = timezone(timedelta(hours=-3))
                 hora_local = datetime.now(tz_brasilia).strftime("%H:%M:%S")
 
@@ -204,7 +176,6 @@ def format_phone(num: str) -> str:
                 )
 
                 forward_text(phone_number_id, compact_text)
-
 
                 # se for mídia, encaminha também
                 if msg_type in ALLOWED_MEDIA_TYPES:
@@ -221,7 +192,7 @@ def format_phone(num: str) -> str:
 # ROTINA DE REENVIO (FILA)
 # ====================================
 def retry_worker():
-    """Thread de retry que tenta reenviar mensagens falhadas."""
+    """Thread de retry persistente"""
     while True:
         try:
             queue = load_retries()
@@ -259,4 +230,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
-
