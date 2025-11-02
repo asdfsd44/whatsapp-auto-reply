@@ -24,7 +24,7 @@ RETRY_FILE = "retries.json"
 LOG_FILE = "app.log"
 
 ALLOWED_MEDIA_TYPES = ["image", "document", "audio"]
-IGNORED_TYPES = ["status", "sticker", "reaction", "location", "unknown", "video"]
+IGNORED_TYPES = ["status"]
 
 MAX_RETRIES = 5
 RETRY_INTERVAL_SECONDS = 60  # intervalo entre tentativas
@@ -230,3 +230,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", f"🚀 Servidor rodando em http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
+
