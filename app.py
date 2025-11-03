@@ -96,7 +96,39 @@ def normalize_number(num: str) -> str:
 # ---------------------------------------------
 # FUNÇÃO: ENVIAR MENSAGEM VIA WHATSAPP
 # ---------------------------------------------
+# ---------------------------------------------
+# FUNÇÃO: ENVIAR MENSAGEM VIA WHATSAPP (CORRIGIDA)
+# ---------------------------------------------
 def send_message(to, text):
+    try:
+        # Remove caracteres indesejados
+        to = str(to).replace("+", "").strip()
+
+        url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "text": {"body": text}
+        }
+
+        r = requests.post(url, headers=headers, json=payload)
+
+        # Log de status resumido
+        logging.info(f"Send message result | data={{'to': '{to}', 'status': {r.status_code}}}")
+
+        # Log detalhado para depuração (temporário)
+        if r.status_code != 200:
+            logging.warning(f"Graph API response | data={{'status': {r.status_code}, 'response': {r.text}}}")
+        else:
+            logging.info(f"Graph API OK | data={{'message_id': {r.json().get('messages', [{}])[0].get('id', 'unknown')}}}")
+
+    except Exception as e:
+        logging.error(f"Erro ao enviar mensagem | data={{'erro': '{str(e)}'}}")
+
     try:
         url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
@@ -190,3 +222,4 @@ if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
 else:
     load_contacts()
+
