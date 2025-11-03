@@ -43,17 +43,17 @@ def log(level, message, data=None):
     getattr(logging, level)(f"{message} | data={s}")
 
 # ====================================
-# CONTATOS (melhorado)
+# CONTATOS
 # ====================================
 def normalize_number(raw):
-    raw = re.sub(r"\D", "", raw or "")
+    """
+    Normaliza o número pegando apenas os 8 últimos dígitos,
+    ignorando DDI e DDD.
+    """
     if not raw:
         return None
-    if raw.startswith("55") and len(raw) > 13:
-        raw = raw[-13:]
-    if not raw.startswith("55"):
-        raw = "55" + raw[-11:]
-    return raw
+    digits = re.sub(r"\D", "", raw)
+    return digits[-8:] if len(digits) >= 8 else digits
 
 def load_contacts_from_drive():
     contacts = {}
@@ -67,16 +67,14 @@ def load_contacts_from_drive():
         resp.raise_for_status()
         text = resp.content.decode("utf-8", errors="ignore")
 
-        # Divide linhas e processa texto livre
         raw_lines = text.splitlines()
         total_lines = len(raw_lines)
+
         for line in raw_lines:
-            # extrai números de telefone
             phones = re.findall(r"\+?\d[\d\s\-\(\)]{8,}\d", line)
             if not phones:
                 continue
-            # tenta extrair nome
-            possible_names = re.findall(r"[A-ZÀ-Ÿ][a-zà-ÿ]+(?: [A-ZÀ-Ÿ][a-zà-ÿ]+)*", line)
+            possible_names = re.findall(r"[A-ZÀ-Ÿ][a-zà-ÿ]+(?: [A-ZÀ-Ÿa-zà-ÿ]+)*", line)
             name = possible_names[0] if possible_names else "Desconhecido"
             for phone in phones:
                 n = normalize_number(phone)
@@ -105,6 +103,8 @@ def send_message(phone_number_id, to, message):
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=15)
         log("info", "Send message result", {"to": to, "status": resp.status_code})
+        if resp.status_code != 200:
+            log("warning", "Graph API response", {"status": resp.status_code, "response": resp.text})
         return resp
     except Exception as e:
         log("error", "Erro ao enviar", {"error": str(e)})
@@ -149,10 +149,20 @@ def webhook():
             if msg_type in IGNORED_TYPES or not sender or not phone_number_id:
                 continue
 
-            norm_sender = re.sub(r"\D", "", sender or "")
+            # Normaliza o número pelo final (8 dígitos)
+            norm_sender = normalize_number(sender)
             name = CONTACTS.get(norm_sender, "Desconhecido")
+
             if name == "Desconhecido":
-                log("info", "Contato não identificado", {"sender": sender, "amostra": list(CONTACTS.keys())[:5]})
+                log("info", "Contato não identificado", {
+                    "sender": sender,
+                    "amostra": list(CONTACTS.keys())[:5]
+                })
+            else:
+                log("info", "Contato identificado", {
+                    "sender": sender,
+                    "nome": name
+                })
 
             text = ""
             if msg_type == "text":
@@ -161,6 +171,7 @@ def webhook():
                 cts = msg.get("contacts", [])
                 text = " | ".join(f"{c.get('name', {}).get('formatted_name', '')} {c.get('phones', [{}])[0].get('phone', '')}" for c in cts)
 
+            # Resposta automática
             reply = (
                 f"Olá! Este número não está mais ativo.\n"
                 f"Por favor, salve meu novo contato e me chame lá:\n"
@@ -168,6 +179,7 @@ def webhook():
             )
             send_message(phone_number_id, sender, {"text": {"body": reply}})
 
+            # Encaminhamento
             hora_local = datetime.now(timezone(timedelta(hours=-3))).strftime("%H:%M:%S")
             formatted_phone = format_phone(sender)
             forward_text = f"👤 {name}\n📱 {formatted_phone}\n🕓 {hora_local}\n💬 {text or '(mensagem de mídia)'}"
