@@ -8,6 +8,8 @@ import time
 import threading
 import logging
 import uuid
+import csv
+import re
 from datetime import datetime, timedelta, timezone
 
 app = Flask(__name__)
@@ -20,6 +22,7 @@ ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
 NEW_NAME = os.environ.get("NEW_NAME", "Novo Contato")
 FORWARD_NUMBER = os.environ.get("FORWARD_NUMBER", "+5534997216766")
+CONTACTS_URL = os.environ.get("CONTACTS_URL")  # link direto do Google Drive
 
 REMETENTES_FILE = "remetentes.txt"
 RETRY_FILE = "retries.json"
@@ -29,8 +32,8 @@ ALLOWED_MEDIA_TYPES = ["image", "document", "audio"]
 IGNORED_TYPES = ["status", "sticker", "reaction", "location", "unknown", "video"]
 
 MAX_RETRIES = 5
-RETRY_INTERVAL_SECONDS = 60  # intervalo entre tentativas
-MAX_LOG_FIELD = 2000  # quando o texto for maior que isso, truncar nos logs
+RETRY_INTERVAL_SECONDS = 60
+MAX_LOG_FIELD = 2000
 
 # ====================================
 # LOGGING (arquivo + console)
@@ -42,12 +45,11 @@ logging.basicConfig(
 )
 
 def log(level: str, message: str, data: dict = None, event_id: str = None):
-    """Log unificado com event_id e truncamento inteligente."""
     prefix = f"[{event_id}] " if event_id else ""
     details = ""
     if data is not None:
         try:
-            s = json.dumps(data, ensure_ascii=False, indent=None)
+            s = json.dumps(data, ensure_ascii=False)
         except Exception:
             s = str(data)
         if len(s) > MAX_LOG_FIELD:
@@ -80,14 +82,12 @@ def save_retries(queue):
         log("error", "Erro ao salvar retries.json", {"error": str(e)})
 
 def enqueue_retry(item):
-    """Adiciona item (dict) na fila persistente de retry."""
     queue = load_retries()
     queue.append(item)
     save_retries(queue)
     log("warning", "Item enfileirado para retry", {"to": item.get("to"), "attempts": item.get("attempts", 0)})
 
 def format_phone(num: str) -> str:
-    """Formata número E.164 → 55 34 997216766 (sem traço)"""
     digits = "".join(ch for ch in (num or "") if ch.isdigit())
     if len(digits) < 10:
         return digits
@@ -104,70 +104,96 @@ def short_json(obj, max_len=MAX_LOG_FIELD):
     return s if len(s) <= max_len else s[:max_len] + "...(truncated)"
 
 # ====================================
-# SEND / FORWARD helpers (com logs ricos)
+# CONTATOS (importação via Google Drive)
+# ====================================
+def normalize_number(raw):
+    if not raw:
+        return None
+    raw = re.sub(r'\D', '', raw)
+    if len(raw) < 10:
+        return None
+    if raw.startswith('55') and len(raw) > 13:
+        raw = raw[-13:]
+    if not raw.startswith('55'):
+        raw = '55' + raw[-11:]
+    return raw
+
+def load_contacts_from_drive(url_or_path=None):
+    contacts = {}
+    url_or_path = url_or_path or CONTACTS_URL
+    if not url_or_path:
+        log("warning", "Nenhuma fonte de contatos definida (CONTACTS_URL ausente)")
+        return contacts
+    try:
+        if url_or_path.startswith("http"):
+            log("info", "Baixando contatos do Google Drive", {"url": url_or_path})
+            resp = requests.get(url_or_path, timeout=20)
+            resp.raise_for_status()
+            content = io.StringIO(resp.content.decode("utf-8", errors="ignore"))
+            reader = csv.reader(content)
+        else:
+            log("info", "Lendo contatos de arquivo local", {"path": url_or_path})
+            reader = csv.reader(open(url_or_path, encoding="utf-8", errors="ignore"))
+
+        for row in reader:
+            if not row:
+                continue
+            name = next((c.strip() for c in row if c and not re.search(r'\d', c)), None)
+            phones = re.findall(r'\+?\d[\d\s\-()]*\d', ' '.join(row))
+            for p in phones:
+                n = normalize_number(p)
+                if n:
+                    contacts[n] = name or "Desconhecido"
+        log("info", "Contatos carregados com sucesso", {"total": len(contacts)})
+    except Exception as e:
+        log("error", "Falha ao carregar contatos", {"error": str(e)})
+    return contacts
+
+CONTACTS = load_contacts_from_drive()
+
+# ====================================
+# SEND / FORWARD helpers
 # ====================================
 def send_message(phone_number_id, to, message):
-    """Envia mensagem via Graph API com logs detalhados."""
     event_id = str(uuid.uuid4())[:8]
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     payload = {"messaging_product": "whatsapp", "to": to}
     payload.update(message)
-
     log("info", "Tentando enviar mensagem", {"url": url, "to": to, "payload": payload}, event_id)
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         status = resp.status_code
-        text = resp.text
-        log("info", "Resposta do Graph API", {"status_code": status, "response_text": text}, event_id)
-
+        log("info", "Resposta do Graph API", {"status_code": status, "response_text": resp.text}, event_id)
         if status != 200:
-            # enfileira para retry automático
             enqueue_retry({
-                "id": event_id,
-                "phone_number_id": phone_number_id,
-                "to": to,
-                "message": message,
-                "attempts": 1,
-                "last_try": time.time()
+                "id": event_id, "phone_number_id": phone_number_id, "to": to,
+                "message": message, "attempts": 1, "last_try": time.time()
             })
-            log("error", "Falha no envio, item colocado em retry", {"status_code": status, "response_text": text}, event_id)
         return resp
     except Exception as e:
         log("error", "Exceção ao postar para Graph API", {"error": str(e)}, event_id)
-        # enfileira também
         enqueue_retry({
-            "id": event_id,
-            "phone_number_id": phone_number_id,
-            "to": to,
-            "message": message,
-            "attempts": 1,
-            "last_try": time.time()
+            "id": event_id, "phone_number_id": phone_number_id, "to": to,
+            "message": message, "attempts": 1, "last_try": time.time()
         })
         return None
 
 def forward_text(phone_number_id, text):
-    """Encaminha texto para FORWARD_NUMBER com logs"""
     to = FORWARD_NUMBER.replace("+", "")
     event_id = str(uuid.uuid4())[:8]
     log("info", "Preparando forward_text", {"to": to, "text": text}, event_id)
     resp = send_message(phone_number_id, to, {"text": {"body": text}})
-    if resp is None:
-        log("error", "forward_text: resposta nula ao enviar", {"to": to}, event_id)
-        return False
-    if resp.status_code != 200:
-        log("error", "forward_text: envio retornou erro", {"status_code": resp.status_code, "response": resp.text}, event_id)
+    if not resp or resp.status_code != 200:
+        log("error", "forward_text falhou", {"status_code": getattr(resp, "status_code", None)}, event_id)
         return False
     log("info", "forward_text: enviado com sucesso", {"to": to}, event_id)
     return True
 
 def forward_media(phone_number_id, media_type, media_id, caption=None):
-    """Encaminha imagem/documento/áudio para FORWARD_NUMBER via media id."""
-    event_id = str(uuid.uuid4())[:8]
     if media_type not in ALLOWED_MEDIA_TYPES:
-        log("warning", "forward_media: tipo de mídia não permitido", {"media_type": media_type}, event_id)
+        log("warning", "forward_media: tipo de mídia não permitido", {"media_type": media_type})
         return False
-
     to = FORWARD_NUMBER.replace("+", "")
     payload = {
         "messaging_product": "whatsapp",
@@ -177,93 +203,49 @@ def forward_media(phone_number_id, media_type, media_id, caption=None):
     }
     if caption:
         payload[media_type]["caption"] = caption
-
-    # log antes de enviar
-    log("info", "forward_media: tentando encaminhar mídia", {"to": to, "media_id": media_id, "media_type": media_type, "caption": caption}, event_id)
-
+    event_id = str(uuid.uuid4())[:8]
     url = f"https://graph.facebook.com/v20.0/{phone_number_id}/messages"
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"}
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        log("info", "forward_media: resposta do Graph API", {"status_code": resp.status_code, "response_text": resp.text}, event_id)
         if resp.status_code != 200:
             enqueue_retry({
-                "id": event_id,
-                "phone_number_id": phone_number_id,
-                "to": to,
-                "message": payload,
-                "attempts": 1,
-                "last_try": time.time()
+                "id": event_id, "phone_number_id": phone_number_id, "to": to,
+                "message": payload, "attempts": 1, "last_try": time.time()
             })
-            log("error", "forward_media: falha no envio, enfileirado", {"status_code": resp.status_code}, event_id)
             return False
-        log("info", "forward_media: enviado com sucesso", {"to": to}, event_id)
         return True
     except Exception as e:
-        log("error", "forward_media: exceção ao enviar mídia", {"error": str(e)}, event_id)
-        enqueue_retry({
-            "id": event_id,
-            "phone_number_id": phone_number_id,
-            "to": to,
-            "message": payload,
-            "attempts": 1,
-            "last_try": time.time()
-        })
+        log("error", "forward_media exceção", {"error": str(e)}, event_id)
         return False
 
 # ====================================
-# MEDIA helper (download original media url)
+# MEDIA helper
 # ====================================
 def fetch_media_url_and_forward(phone_number_id, media_id, media_type, caption=None):
-    """Baixa URL da API e tenta encaminhar usando media_id (quando possível)."""
     event_id = str(uuid.uuid4())[:8]
     try:
-        # 1) Pega meta da mídia (contém url)
         meta_url = f"https://graph.facebook.com/v20.0/{media_id}"
         headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-        log("info", "fetch_media: solicitando meta da mídia", {"meta_url": meta_url}, event_id)
         meta_resp = requests.get(meta_url, headers=headers, timeout=15)
-        try:
-            meta_json = meta_resp.json()
-        except Exception:
-            log("error", "fetch_media: meta_resp não é JSON", {"status_code": meta_resp.status_code, "text": meta_resp.text}, event_id)
-            return False
-
+        meta_json = meta_resp.json()
         media_url = meta_json.get("url")
         if not media_url:
-            log("error", "fetch_media: url não encontrada na meta", {"meta": short_json(meta_json)}, event_id)
             return False
-
-        # 2) Baixa conteúdo da URL (protegida) – passar o mesmo header
-        log("info", "fetch_media: baixando conteúdo da URL", {"media_url": media_url}, event_id)
         content_resp = requests.get(media_url, headers=headers, timeout=30)
         if content_resp.status_code != 200:
-            log("error", "fetch_media: falha ao baixar conteúdo", {"status_code": content_resp.status_code}, event_id)
             return False
-
-        # 3) Faz upload para Graph /media para obter novo media_id (da conta do app)
         upload_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
-        files = {'file': ('file', content_resp.content)}  # let API deduzir mime
+        files = {'file': ('file', content_resp.content)}
         data = {'messaging_product': 'whatsapp'}
         upload_resp = requests.post(upload_url, headers=headers, files=files, data=data, timeout=30)
-        try:
-            upload_json = upload_resp.json()
-        except Exception:
-            log("error", "fetch_media: upload_resp não é JSON", {"status_code": upload_resp.status_code, "text": upload_resp.text}, event_id)
-            return False
-
-        new_media_id = upload_json.get("id")
-        log("info", "fetch_media: upload realizado", {"new_media_id": new_media_id, "upload_resp": short_json(upload_json)}, event_id)
+        up_json = upload_resp.json()
+        new_media_id = up_json.get("id")
         if not new_media_id:
-            log("error", "fetch_media: novo media_id não retornado", {"upload_resp": short_json(upload_json)}, event_id)
             return False
-
-        # 4) Encaminha com novo media_id
-        result = forward_media(phone_number_id, media_type, new_media_id, caption)
-        return result
-
+        return forward_media(phone_number_id, media_type, new_media_id, caption)
     except Exception as e:
-        log("error", "fetch_media: exceção geral", {"error": str(e)}, event_id)
+        log("error", "fetch_media_url_and_forward erro", {"error": str(e)}, event_id)
         return False
 
 # ====================================
@@ -271,7 +253,11 @@ def fetch_media_url_and_forward(phone_number_id, media_id, media_type, caption=N
 # ====================================
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "timestamp": datetime.utcnow().isoformat()}), 200
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "contacts_loaded": len(CONTACTS)
+    }), 200
 
 # ====================================
 # WEBHOOK
@@ -299,166 +285,71 @@ def webhook():
         return "ok", 200
 
     if not data:
-        log("warning", "Webhook vazio", None, event_id)
         return "ok", 200
 
-    log("info", "Processando webhook entries", {"entries": len(data.get("entry", []))}, event_id)
+    for entry in data.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            messages = value.get("messages", [])
+            if not messages:
+                continue
 
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                value = change.get("value", {})
-                messages = value.get("messages", [])
-                if not messages:
-                    log("info", "Nenhuma mensagem neste change", {"change": short_json(change)}, event_id)
-                    continue
+            msg = messages[0]
+            sender = msg.get("from")
+            phone_number_id = value.get("metadata", {}).get("phone_number_id")
+            msg_type = msg.get("type", "text")
 
-                msg = messages[0]
-                sender = msg.get("from")
-                phone_number_id = value.get("metadata", {}).get("phone_number_id")
-                msg_type = msg.get("type", "text")
+            if not phone_number_id:
+                continue
+            if sender == FORWARD_NUMBER.replace("+", ""):
+                continue
+            if msg_type in IGNORED_TYPES:
+                continue
 
-                log("info", "Mensagem recebida", {"sender": sender, "phone_number_id": phone_number_id, "type": msg_type}, event_id)
+            name = CONTACTS.get(sender, msg.get("profile", {}).get("name", "") or "Desconhecido")
 
-                # segurança básica: precisa phone_number_id
-                if not phone_number_id:
-                    log("error", "phone_number_id ausente no payload", {"change": short_json(change)}, event_id)
-                    continue
-
-                # evita loop: ignore mensagens enviadas pelo own FORWARD_NUMBER
-                if sender == FORWARD_NUMBER.replace("+", ""):
-                    log("info", "Mensagem originada do forward number — ignorando para evitar loop", {"sender": sender}, event_id)
-                    continue
-
-                # ignora tipos indesejados
-                if msg_type in IGNORED_TYPES:
-                    log("info", "Tipo de mensagem ignorado", {"type": msg_type}, event_id)
-                    continue
-
-                # salva remetente
-                try:
-                    with open(REMETENTES_FILE, "a", encoding="utf-8") as f:
-                        f.write(f"{sender}\t{msg.get('profile', {}).get('name','')}\t{now_iso()}\n")
-                    log("info", "Remetente registrado", {"sender": sender}, event_id)
-                except Exception as e:
-                    log("error", "Erro ao escrever remetentes.txt", {"error": str(e)}, event_id)
-
-                # extrai dados
-                name = msg.get("profile", {}).get("name", "")
-                text = ""
-                if msg_type == "text":
-                    text = msg.get("text", {}).get("body", "")
-                elif msg_type == "interactive":
-                    # botão/lista
-                    interactive = msg.get("interactive", {})
-                    itype = interactive.get("type")
-                    if itype == "button":
-                        text = interactive.get("button", {}).get("text") or interactive.get("button", {}).get("payload", "")
-                    elif itype == "list_reply":
-                        text = interactive.get("list_reply", {}).get("title") or interactive.get("list_reply", {}).get("id", "")
-                elif msg_type == "contacts":
-                    # contacts: montar texto e também encaminhar vCard (recriado)
-                    contacts = msg.get("contacts", [])
-                    contact_texts = []
-                    for c in contacts:
-                        fname = c.get("name", {}).get("formatted_name", "")
-                        phones = c.get("phones", [])
-                        ph = phones[0].get("phone") if phones else ""
-                        contact_texts.append(f"{fname} {ph}")
-                    text = " | ".join(contact_texts) if contact_texts else ""
-                else:
-                    text = short_json(msg)
-
-                # responde ao remetente com mensagem padrão
-                reply = (
-                    f"Olá! Este número não está mais ativo.\n"
-                    f"Por favor, salve meu novo contato e me chame lá:\n"
-                    f"👉 https://wa.me/{NEW_NUMBER.replace('+', '') if NEW_NUMBER else ''}"
-                )
-                send_resp = send_message(phone_number_id, sender, {"text": {"body": reply}})
-                if send_resp is None:
-                    log("error", "Resposta ao remetente falhou (send_response is None)", {"sender": sender}, event_id)
-                else:
-                    log("info", "Resposta ao remetente enviada", {"status_code": send_resp.status_code, "response": send_resp.text}, event_id)
-
-                # preparar texto compacto para encaminhar
-                tz_brasilia = timezone(timedelta(hours=-3))
-                hora_local = datetime.now(tz_brasilia).strftime("%H:%M:%S")
-                formatted_phone = format_phone(sender)
-                compact_text = (
-                    f"👤 {name or 'Desconhecido'}\n"
-                    f"📱 {formatted_phone}\n"
-                    f"🕓 {hora_local}\n"
-                    f"💬 {text or '(mensagem de mídia)'}"
+            text = ""
+            if msg_type == "text":
+                text = msg.get("text", {}).get("body", "")
+            elif msg_type == "interactive":
+                interactive = msg.get("interactive", {})
+                itype = interactive.get("type")
+                if itype == "button":
+                    text = interactive.get("button", {}).get("text") or interactive.get("button", {}).get("payload", "")
+                elif itype == "list_reply":
+                    text = interactive.get("list_reply", {}).get("title") or interactive.get("list_reply", {}).get("id", "")
+            elif msg_type == "contacts":
+                contacts = msg.get("contacts", [])
+                text = " | ".join(
+                    f"{c.get('name', {}).get('formatted_name', '')} {c.get('phones', [{}])[0].get('phone', '')}"
+                    for c in contacts
                 )
 
-                # encaminha texto compactado
-                forwarded_ok = forward_text(phone_number_id, compact_text)
-                if not forwarded_ok:
-                    log("error", "Falha ao encaminhar texto compacto", {"to": FORWARD_NUMBER, "sender": sender}, event_id)
+            reply = (
+                f"Olá! Este número não está mais ativo.\n"
+                f"Por favor, salve meu novo contato e me chame lá:\n"
+                f"👉 https://wa.me/{NEW_NUMBER.replace('+', '') if NEW_NUMBER else ''}"
+            )
+            send_message(phone_number_id, sender, {"text": {"body": reply}})
 
-                # se for mídia (image/document/audio): obter media id e tentar encaminhar
-                if msg_type in ALLOWED_MEDIA_TYPES:
-                    media_obj = msg.get(msg_type, {})
-                    media_id = media_obj.get("id")
-                    caption = media_obj.get("caption", "")
-                    if not media_id:
-                        log("warning", "Mídia sem media_id no payload", {"msg": short_json(msg)}, event_id)
-                    else:
-                        # tenta encaminhar diretamente usando media_id (padrão)
-                        ok = forward_media(phone_number_id, msg_type, media_id, caption)
-                        if not ok:
-                            # fallback: baixar a mídia e re-upload/forward
-                            log("info", "forward_media falhou, tentando fetch+upload", {"media_id": media_id}, event_id)
-                            ok2 = fetch_media_url_and_forward(phone_number_id, media_id, msg_type, caption)
-                            if not ok2:
-                                log("error", "Falha ao encaminhar mídia mesmo após fetch+upload", {"media_id": media_id}, event_id)
+            tz_brasilia = timezone(timedelta(hours=-3))
+            hora_local = datetime.now(tz_brasilia).strftime("%H:%M:%S")
+            formatted_phone = format_phone(sender)
+            compact_text = (
+                f"👤 {name}\n"
+                f"📱 {formatted_phone}\n"
+                f"🕓 {hora_local}\n"
+                f"💬 {text or '(mensagem de mídia)'}"
+            )
 
-                # se for contato, recriar .vcf e enviar como documento (opcional)
-                if msg_type == "contacts":
-                    contacts = msg.get("contacts", [])
-                    for c in contacts:
-                        nome_contato = c.get("name", {}).get("formatted_name", "Contato sem nome")
-                        telefones = c.get("phones", [])
-                        numero_contato = telefones[0].get("phone") if telefones else ""
-                        vcard_content = f"""BEGIN:VCARD
-VERSION:3.0
-FN:{nome_contato}
-TEL;type=CELL:{numero_contato}
-END:VCARD
-"""
-                        try:
-                            arquivo_vcf = io.BytesIO(vcard_content.encode("utf-8"))
-                            upload_url = f"https://graph.facebook.com/v20.0/{phone_number_id}/media"
-                            headers = {'Authorization': f'Bearer {ACCESS_TOKEN}'}
-                            files = {'file': (f"{nome_contato}.vcf", arquivo_vcf, 'text/plain')}
-                            data = {'messaging_product': 'whatsapp'}
-                            upload_resp = requests.post(upload_url, headers=headers, files=files, data=data, timeout=30)
-                            log("info", "contacts: upload do vCard realizado", {"status_code": upload_resp.status_code, "response": upload_resp.text}, event_id)
-                            up_json = {}
-                            try:
-                                up_json = upload_resp.json()
-                            except Exception:
-                                pass
-                            media_id = up_json.get("id")
-                            if media_id:
-                                # enviar como documento ao FORWARD_NUMBER
-                                doc_payload = {
-                                    "type": "document",
-                                    "document": {"id": media_id, "filename": f"{nome_contato}.vcf", "caption": f"Contato: {nome_contato}"}
-                                }
-                                resp = send_message(phone_number_id, FORWARD_NUMBER.replace("+", ""), doc_payload)
-                                if resp is None or resp.status_code != 200:
-                                    log("error", "contacts: falha ao enviar vCard para FORWARD_NUMBER", {"status": getattr(resp, "status_code", None), "text": getattr(resp, "text", None)}, event_id)
-                                else:
-                                    log("info", "contacts: vCard enviado com sucesso para FORWARD_NUMBER", {"to": FORWARD_NUMBER}, event_id)
-                            else:
-                                log("warning", "contacts: upload não retornou media_id", {"upload_resp": short_json(up_json)}, event_id)
-                        except Exception as e:
-                            log("error", "contacts: exceção ao processar contato", {"error": str(e), "contact": c}, event_id)
+            forward_text(phone_number_id, compact_text)
 
-    except Exception as e:
-        log("error", "Erro geral ao processar webhook", {"error": str(e), "incoming": short_json(data)}, event_id)
+            if msg_type in ALLOWED_MEDIA_TYPES:
+                media_obj = msg.get(msg_type, {})
+                media_id = media_obj.get("id")
+                caption = media_obj.get("caption", "")
+                if not forward_media(phone_number_id, msg_type, media_id, caption):
+                    fetch_media_url_and_forward(phone_number_id, media_id, msg_type, caption)
 
     return "ok", 200
 
@@ -472,45 +363,36 @@ def retry_worker():
             if not queue:
                 time.sleep(RETRY_INTERVAL_SECONDS)
                 continue
-
-            log("info", "Iniciando ciclo de retry", {"pending": len(queue)})
             new_queue = []
             for item in queue:
                 attempts = item.get("attempts", 0)
                 if attempts >= MAX_RETRIES:
-                    log("warning", "Descartando item após max attempts", {"id": item.get("id"), "attempts": attempts})
                     continue
                 last_try = item.get("last_try", 0)
                 now_ts = time.time()
                 if now_ts - last_try < RETRY_INTERVAL_SECONDS:
                     new_queue.append(item)
                     continue
-
-                # tentar reenviar
                 phone_number_id = item.get("phone_number_id")
                 to = item.get("to")
                 message = item.get("message")
-                log("info", "Tentando reenvio de item", {"id": item.get("id"), "to": to, "attempts": attempts})
                 try:
-                    resp = requests.post(f"https://graph.facebook.com/v20.0/{phone_number_id}/messages",
-                                         headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
-                                         json=message, timeout=20)
-                    if resp.status_code == 200:
-                        log("info", "Retry bem-sucedido", {"id": item.get("id"), "to": to})
-                    else:
+                    resp = requests.post(
+                        f"https://graph.facebook.com/v20.0/{phone_number_id}/messages",
+                        headers={"Authorization": f"Bearer {ACCESS_TOKEN}", "Content-Type": "application/json"},
+                        json=message, timeout=20
+                    )
+                    if resp.status_code != 200:
                         item["attempts"] = attempts + 1
                         item["last_try"] = now_ts
                         new_queue.append(item)
-                        log("warning", "Retry falhou, permanecerá na fila", {"id": item.get("id"), "status": resp.status_code, "response": resp.text})
-                except Exception as e:
+                except Exception:
                     item["attempts"] = attempts + 1
                     item["last_try"] = now_ts
                     new_queue.append(item)
-                    log("error", "Retry: exceção ao reenviar item", {"id": item.get("id"), "error": str(e)})
-
             save_retries(new_queue)
         except Exception as e:
-            log("error", "Thread retry: exceção não esperada", {"error": str(e)})
+            log("error", "retry_worker erro", {"error": str(e)})
         time.sleep(RETRY_INTERVAL_SECONDS)
 
 threading.Thread(target=retry_worker, daemon=True).start()
