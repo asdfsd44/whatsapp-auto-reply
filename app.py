@@ -306,14 +306,20 @@ def webhook():
             if msg_type in IGNORED_TYPES:
                 continue
 
-            norm_sender = re.sub(r'\D', '', sender or '') name = CONTACTS.get(norm_sender, CONTACTS.get('+' + norm_sender, msg.get("profile", {}).get("name", "") or "Desconhecido"))
+          norm_sender = re.sub(r'\D', '', sender or '')
+name = CONTACTS.get(
+    norm_sender,
+    CONTACTS.get('+' + norm_sender, msg.get("profile", {}).get("name", "") or "Desconhecido")
+)
 
-            if name == "Desconhecido":
+# 🔍 Log de diagnóstico para identificar formato de números
+if name == "Desconhecido":
     log("info", "Contato não identificado no CSV", {
         "sender": sender,
         "norm_sender": norm_sender,
         "csv_keys_sample": list(CONTACTS.keys())[:5]
     })
+
 
             text = ""
             if msg_type == "text":
@@ -411,4 +417,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", "➡️ Aplicação iniciando", {"port": port})
     app.run(host="0.0.0.0", port=port)
+
 
