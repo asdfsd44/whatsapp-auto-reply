@@ -19,7 +19,7 @@ app = Flask(__name__)
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 NEW_NUMBER = os.environ.get("NEW_NUMBER")
-FORWARD_NUMBER = os.environ.get("FORWARD_NUMBER", "+5534997216766")
+FORWARD_NUMBER = os.environ.get("FORWARD_NUMBER")
 CONTACTS_URL = os.environ.get("CONTACTS_URL")
 
 LOG_FILE = "app.log"
@@ -205,3 +205,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", "➡️ Aplicação iniciando", {"port": port})
     app.run(host="0.0.0.0", port=port)
+
