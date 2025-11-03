@@ -208,8 +208,14 @@ def verify():
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # atualiza atividade assim que recebemos qualquer webhook (renova janela)
-    update_activity()
+    # atualiza atividade apenas se o remetente for o seu número
+try:
+    payload = request.get_json()
+    sender_id = payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("from")
+    if sender_id and sender_id.endswith("97216766"):  # últimos dígitos do seu número
+        update_activity()
+except Exception:
+    pass
 
     event_id = str(uuid.uuid4())[:8]
     raw = request.get_data(as_text=True)
@@ -302,3 +308,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     log("info", "➡️ Aplicação iniciando", {"port": port})
     app.run(host="0.0.0.0", port=port)
+
