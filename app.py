@@ -157,6 +157,19 @@ def check_meta_session():
 threading.Thread(target=check_meta_session, daemon=True).start()
 
 # ==========================================================
+# 🔒 BLOQUEIO DE NÚMEROS (ANTI-SPAM)
+# ==========================================================
+def get_blocked_numbers():
+    """Lê variável BLOCKED_NUMBERS e retorna lista de números bloqueados."""
+    blocked_raw = os.getenv("BLOCKED_NUMBERS", "")
+    return [num.strip() for num in blocked_raw.split(",") if num.strip()]
+
+def is_blocked_number(sender_number):
+    """Verifica se o número está bloqueado."""
+    blocked = get_blocked_numbers()
+    return sender_number in blocked
+
+# ==========================================================
 # WEBHOOK HANDLER
 # ==========================================================
 @app.route("/webhook", methods=["GET"])
@@ -175,7 +188,7 @@ def webhook():
     try:
         payload = request.get_json()
         sender_id = payload.get("entry", [{}])[0].get("changes", [{}])[0].get("value", {}).get("messages", [{}])[0].get("from")
-        if sender_id and sender_id.endswith("97216766"):
+        if sender_id and sender_id.endswith("97216766"):  # Seu número principal
             update_activity()
     except Exception:
         pass
@@ -196,6 +209,12 @@ def webhook():
 
             msg = messages[0]
             sender = msg.get("from")
+
+            # 🧱 BLOQUEIO DE NÚMEROS INDESEJADOS
+            if is_blocked_number(sender):
+                log("warning", "Mensagem ignorada por bloqueio", {"from": sender})
+                return "ignored", 200
+
             phone_number_id = value.get("metadata", {}).get("phone_number_id")
             msg_type = msg.get("type", "text")
             if msg_type in ["status", "reaction", "sticker", "unknown"]:
@@ -214,7 +233,7 @@ def webhook():
                 name = "Desconhecido"
 
             text = msg.get("text", {}).get("body", "") if msg_type == "text" else "(mensagem de mídia)"
-            reply = f"Olá! Este número não está mais ativo.\nPor favor, salve meu novo contato:\n👉 https://wa.me/{NEW_NUMBER.replace('+', '') if NEW_NUMBER else ''}"
+            reply = f"Olá! Este número não está mais ativo.\nPor favor, salve meu novo contato e me chame lá:\n👉 https://wa.me/{NEW_NUMBER.replace('+', '') if NEW_NUMBER else ''}"
             send_message(phone_number_id, sender, {"text": {"body": reply}})
 
             hora = datetime.now(timezone(timedelta(hours=-3))).strftime("%H:%M:%S")
